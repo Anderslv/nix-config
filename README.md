@@ -22,6 +22,15 @@ cd nix-config
 nix develop
 ```
 
+Use the Home Manager package groups (core, dev, emacs, scripts; no GUI) without
+activating anything — also works on macOS (`aarch64-darwin`). Packages that are
+unavailable on the current platform are skipped:
+
+```bash
+nix shell            # tools added to the current shell's PATH
+nix develop .#env    # same tools in a dev shell
+```
+
 Useful commands:
 
 ```bash
@@ -48,5 +57,7 @@ nix flake show
 - `homeConfigurations` — Home Manager profiles
 - `nixosConfigurations` — NixOS host configs
 - `packages` / `apps` — exported packages and runnable apps
+- `packages.default` — Home Manager package groups as a plain environment
 - `devShells.default` — development environment with hooks
+- `devShells.env` — dev shell with `packages.default`
 - `formatter` / `checks` — formatting and validation

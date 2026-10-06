@@ -88,10 +88,13 @@
     }:
     let
       lib = import ./lib { inherit nixpkgs inputs; };
-      inherit (lib) forAllSystems generalPackages;
+      inherit (lib) forAllSystems generalPackages mkUserEnv;
     in
     {
       homeConfigurations = import ./home { inherit lib; };
+      packages = forAllSystems (pkgs: {
+        default = mkUserEnv pkgs.stdenv.hostPlatform.system;
+      });
       nixosConfigurations = import ./nixos { inherit nixpkgs inputs lib; };
       checks = forAllSystems (pkgs: {
         pre-commit-check = git-hooks.lib.${pkgs.stdenv.hostPlatform.system}.run (
@@ -112,6 +115,13 @@
         ''
       );
       devShells = forAllSystems (pkgs: {
+        env = pkgs.mkShell {
+          packages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+          shellHook = ''
+            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+            export PS1="(nix-env 🧰) $PS1"
+          '';
+        };
         default =
           let
             inherit (self.checks.${pkgs.stdenv.hostPlatform.system}) pre-commit-check;
