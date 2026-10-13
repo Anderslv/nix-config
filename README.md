@@ -5,6 +5,7 @@
   - [Quick start](#quick-start)
   - [Layout](#layout)
   - [Main outputs](#main-outputs)
+  - [Secrets](#secrets)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -45,11 +46,13 @@ nix flake show
 - `nixos/` — NixOS hosts, shared defaults, user modules
 - `dotfiles/` — editor, shell, browser, terminal, and desktop configs
 - `bin/` — custom helper commands wrapped into packages
-- `scripts/` — supporting scripts for desktop, wallpaper, SSH, and shell
-  workflows
+- `scripts/` — supporting scripts for desktop, wallpaper, SSH, shell, and
+  secrets workflows
+- `secrets/` — sops-encrypted secrets (see [Secrets](#secrets))
 - `lib/` — shared helpers used by flake outputs
 - `overlays/` — package overlays
 - `nix/` — repo checks and git hook configuration
+- `docs/` — longer-form docs, e.g. the secrets workflow
 - `archive/` — legacy/archived experiments
 
 ## Main outputs
@@ -61,3 +64,12 @@ nix flake show
 - `devShells.default` — development environment with hooks
 - `devShells.env` — dev shell with `packages.default`
 - `formatter` / `checks` — formatting and validation
+
+## Secrets
+
+Personal secrets are encrypted with [sops](https://github.com/getsops/sops)
+and [age](https://age-encryption.org/), wired into Home Manager via
+[sops-nix](https://github.com/Mic92/sops-nix). The age private key lives in
+KeePassXC and is bootstrapped onto each machine with `sops-age-bootstrap`.
+See [`docs/secrets.md`](docs/secrets.md) for the full setup and day-to-day
+workflow.
