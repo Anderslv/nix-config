@@ -33,7 +33,14 @@ in
       gui.enable = lib.mkEnableOption "GUI packages, programs and services";
     };
 
-  config.home.packages = lib.concatMap (name: lib.optionals cfg.${name}.enable cfg.${name}.packages) (
-    builtins.attrNames packageSets
-  );
+  # Packages unavailable on the current platform (e.g. Linux-only tools on
+  # darwin), directly or through a dependency, are dropped.
+  config.home.packages =
+    builtins.filter
+      (pkg: lib.meta.availableOn pkgs.stdenv.hostPlatform pkg && (builtins.tryEval pkg.drvPath).success)
+      (
+        lib.concatMap (name: lib.optionals cfg.${name}.enable cfg.${name}.packages) (
+          builtins.attrNames packageSets
+        )
+      );
 }
