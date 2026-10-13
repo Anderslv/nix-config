@@ -11,9 +11,12 @@ let
     name = "tmux-net-status";
     runtimeInputs = [
       pkgs.coreutils
+      pkgs.tmux
+    ]
+    # macOS uses the system ping; ss is unavailable and the script falls back.
+    ++ lib.optionals pkgs.stdenv.isLinux [
       pkgs.iputils
       pkgs.iproute2
-      pkgs.tmux
     ];
     text = builtins.readFile ../../scripts/tmux/net-status.sh;
   };
