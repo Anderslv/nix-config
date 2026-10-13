@@ -51,4 +51,12 @@ in
     inherit lib;
   };
 
+  "example-user@example-host" = mkHomeConfig {
+    system = "aarch64-darwin";
+    username = "example-user";
+    homeDirectory = "/Users/example-user";
+    extraModules = [ ./systems/macmini.nix ];
+    inherit lib;
+  };
+
 }
