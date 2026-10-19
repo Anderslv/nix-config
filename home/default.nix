@@ -51,12 +51,7 @@ in
     inherit lib;
   };
 
-  "example-user@example-host" = mkHomeConfig {
-    system = "aarch64-darwin";
-    username = "example-user";
-    homeDirectory = "/Users/example-user";
-    extraModules = [ ./systems/macmini.nix ];
-    inherit lib;
-  };
+  # example-user@example-host (macOS Mac mini) is managed through
+  # nix-darwin instead: darwinConfigurations.example-host in ../darwin.
 
 }

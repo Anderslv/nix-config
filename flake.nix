@@ -13,6 +13,10 @@
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    nix-darwin = {
+      url = "github:nix-darwin/nix-darwin/master";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     sops-nix = {
       url = "github:Mic92/sops-nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -100,6 +104,7 @@
         default = mkUserEnv pkgs.stdenv.hostPlatform.system;
       });
       nixosConfigurations = import ./nixos { inherit nixpkgs inputs lib; };
+      darwinConfigurations = import ./darwin { inherit inputs lib; };
       checks = forAllSystems (pkgs: {
         pre-commit-check = git-hooks.lib.${pkgs.stdenv.hostPlatform.system}.run (
           import ./nix/git-hooks.nix {

@@ -44,6 +44,7 @@ nix flake show
 - `flake.nix` — flake entrypoint, outputs, checks, dev shell
 - `home/` — Home Manager profiles, shared modules, per-system overrides
 - `nixos/` — NixOS hosts, shared defaults, user modules
+- `darwin/` — nix-darwin hosts (macOS), with Home Manager wired in
 - `dotfiles/` — editor, shell, browser, terminal, and desktop configs
 - `bin/` — custom helper commands wrapped into packages
 - `scripts/` — supporting scripts for desktop, wallpaper, SSH, shell, and
@@ -59,6 +60,7 @@ nix flake show
 
 - `homeConfigurations` — Home Manager profiles
 - `nixosConfigurations` — NixOS host configs
+- `darwinConfigurations` — nix-darwin host configs (`darwin-rebuild switch --flake .#example-host`)
 - `packages` / `apps` — exported packages and runnable apps
 - `packages.default` — Home Manager package groups as a plain environment
 - `devShells.default` — development environment with hooks
