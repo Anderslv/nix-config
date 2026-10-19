@@ -43,6 +43,18 @@
       files = "^README\\.md$";
     };
     end-of-file-fixer.enable = true;
+    forbid-secret-files = {
+      enable = true;
+      name = "forbid-secret-files";
+      description = "Secrets live in KeePassXC only, never in git (docs/secrets.md)";
+      entry = toString (
+        pkgs.writeShellScript "forbid-secret-files" ''
+          printf 'Refusing to commit secret material: %s\n' "$@" >&2
+          exit 1
+        ''
+      );
+      files = "^secrets/|(^|/)(\\.env(\\..*)?|.*\\.agekey|.*\\.kdbx|.*\\.sops\\..*|\\.sops\\.yaml|age-key\\.txt|keys\\.txt)$";
+    };
     fix-byte-order-marker.enable = true;
     keep-sorted = {
       enable = true;

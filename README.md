@@ -49,10 +49,10 @@ nix flake show
 - `bin/` — custom helper commands wrapped into packages
 - `scripts/` — supporting scripts for desktop, wallpaper, SSH, shell, and
   secrets workflows
-- `secrets/` — sops-encrypted secrets (see [Secrets](#secrets))
 - `lib/` — shared helpers used by flake outputs
 - `overlays/` — package overlays
-- `nix/` — repo checks and git hook configuration
+- `nix/` — repo checks, git hook configuration, secrets tooling
+- `dev/tests/` — tests for repo scripts (e.g. `nix run .#secrets-setup-tests`)
 - `docs/` — longer-form docs, e.g. the secrets workflow
 - `archive/` — legacy/archived experiments
 
@@ -69,10 +69,8 @@ nix flake show
 
 ## Secrets
 
-Personal secrets are encrypted with [sops](https://github.com/getsops/sops)
-and [age](https://age-encryption.org/), wired into Home Manager via
-[sops-nix](https://github.com/Mic92/sops-nix). The age key, and the Mac's
-username and hostname, are defined only in KeePassXC; `nix-secrets-setup`
-checks them and derives the local files from them.
-See [`docs/secrets.md`](docs/secrets.md) for the full setup and day-to-day
-workflow.
+No secrets are committed, encrypted or not. They live only in KeePassXC;
+`nix-secrets-setup` checks the vault, helps fill in anything missing, and
+derives local sops files outside the repo for
+[sops-nix](https://github.com/Mic92/sops-nix) and `darwin-switch`. See
+[`docs/secrets.md`](docs/secrets.md).

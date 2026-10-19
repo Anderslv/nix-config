@@ -97,11 +97,15 @@ result
 dotfiles/vicinae/*/node_modules/
 dotfiles/vicinae/*/vicinae-env.d.ts
 
-# Raw age/sops key material must never be committed; it belongs in
-# KeePassXC only (see docs/secrets.md).
-age-key.txt
+# No secrets in this repo, encrypted or not: they live in KeePassXC and are
+# derived outside the repo (see docs/secrets.md). The secret-files hook in
+# nix/git-hooks.nix blocks these even if force-added.
+.env
+.env.*
 *.agekey
-secrets/keys.txt
-secrets/*.agekey
-# Generated from KeePassXC by nix-secrets-setup; the key label stays local.
+*.kdbx
+*.sops.*
 .sops.yaml
+age-key.txt
+keys.txt
+/secrets/

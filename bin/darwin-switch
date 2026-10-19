@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # darwin-rebuild for this repo's nix-darwin host. The username and hostname
-# are not in the repo; they are decrypted from secrets/host.yaml (written by
-# nix-secrets-setup from KeePassXC) and handed to the flake through the
-# environment, which needs --impure.
+# are not in the repo; they are decrypted from ~/.config/nix-secrets/host.yaml
+# (derived from KeePassXC by nix-secrets-setup) and handed to the flake
+# through the environment, which needs --impure.
 #
 # Usage: darwin-switch [switch|build|check|...] [darwin-rebuild args...]
 
 repo="${NIX_CONFIG_DIR:-$(git rev-parse --show-toplevel)}"
-host_file="$repo/secrets/host.yaml"
-export SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt}"
+host_file="${NIX_SECRETS_DIR:-$HOME/.config/nix-secrets}/host.yaml"
+export SOPS_AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"
 
 if [[ ! -f "$host_file" || ! -f "$SOPS_AGE_KEY_FILE" ]]; then
 	echo "Error: missing $host_file or $SOPS_AGE_KEY_FILE; run nix-secrets-setup first." >&2

@@ -8,6 +8,11 @@
 
 let
   tools = import ../../nix/secrets-tools.nix { inherit pkgs inputs; };
+  # Generated from KeePassXC by nix-secrets-setup; never part of the repo.
+  secretsDir = "${config.home.homeDirectory}/.config/nix-secrets";
+  secretNames = builtins.filter (
+    line: line != "" && !lib.hasPrefix "#" line
+  ) (lib.splitString "\n" (builtins.readFile ../../nix/secret-names.txt));
 in
 
 {
@@ -16,11 +21,11 @@ in
   config = lib.mkIf config.customSecrets.enable {
     sops = {
       age.keyFile = "${config.home.homeDirectory}/.config/sops/age/keys.txt";
-      defaultSopsFile = ../../secrets/secrets.yaml;
-      # The default sops file may not exist yet on a fresh checkout (see
-      # docs/secrets.md); only declared `sops.secrets.*` entries actually
-      # need it to resolve, so don't fail eval just because it's missing.
+      # A string, not a path: Nix never reads or copies the file; sops-nix
+      # decrypts it from disk at activation.
+      defaultSopsFile = "${secretsDir}/secrets.yaml";
       validateSopsFiles = false;
+      secrets = lib.genAttrs secretNames (_: { });
     };
 
     home.packages = [
@@ -30,7 +35,8 @@ in
       # keepassxc-cli is needed to set up secrets even on headless machines,
       # e.g. macmini.nix, which disables GUI packages.
       pkgs.keepassxc
+      tools.nix-secrets-setup
     ]
-    ++ builtins.attrValues tools;
+    ++ lib.optional (tools ? darwin-switch) tools.darwin-switch;
   };
 }
