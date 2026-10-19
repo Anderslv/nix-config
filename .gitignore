@@ -103,3 +103,5 @@ age-key.txt
 *.agekey
 secrets/keys.txt
 secrets/*.agekey
+# Generated from KeePassXC by nix-secrets-setup; the key label stays local.
+.sops.yaml

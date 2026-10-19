@@ -51,7 +51,7 @@ in
     inherit lib;
   };
 
-  # example-user@example-host (macOS Mac mini) is managed through
-  # nix-darwin instead: darwinConfigurations.example-host in ../darwin.
+  # The macOS Mac mini is managed through nix-darwin instead (../darwin); its
+  # username and hostname live in KeePassXC/sops, not here.
 
 }

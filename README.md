@@ -60,7 +60,7 @@ nix flake show
 
 - `homeConfigurations` — Home Manager profiles
 - `nixosConfigurations` — NixOS host configs
-- `darwinConfigurations` — nix-darwin host configs (`darwin-rebuild switch --flake .#example-host`)
+- `darwinConfigurations` — nix-darwin host configs (`darwin-switch`, see [Secrets](#secrets))
 - `packages` / `apps` — exported packages and runnable apps
 - `packages.default` — Home Manager package groups as a plain environment
 - `devShells.default` — development environment with hooks
@@ -71,7 +71,8 @@ nix flake show
 
 Personal secrets are encrypted with [sops](https://github.com/getsops/sops)
 and [age](https://age-encryption.org/), wired into Home Manager via
-[sops-nix](https://github.com/Mic92/sops-nix). The age private key lives in
-KeePassXC and is bootstrapped onto each machine with `sops-age-bootstrap`.
+[sops-nix](https://github.com/Mic92/sops-nix). The age key, and the Mac's
+username and hostname, are defined only in KeePassXC; `nix-secrets-setup`
+checks them and derives the local files from them.
 See [`docs/secrets.md`](docs/secrets.md) for the full setup and day-to-day
 workflow.

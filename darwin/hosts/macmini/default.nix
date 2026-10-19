@@ -2,12 +2,10 @@
   inputs,
   lib,
   pkgs,
+  username,
   ...
 }:
 
-let
-  username = "example-user";
-in
 {
   imports = [ inputs.home-manager.darwinModules.home-manager ];
 

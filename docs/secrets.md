@@ -1,75 +1,75 @@
 # Secrets (sops + age + KeePassXC)
 
-Secrets (API tokens, personal credentials, etc.) are encrypted at rest with
-[sops](https://github.com/getsops/sops) using [age](https://age-encryption.org/)
-as the cipher, and wired into Home Manager via
-[sops-nix](https://github.com/Mic92/sops-nix). The age *private* key never
-lives in this repo; it's stored as an attachment in KeePassXC and copied
-onto each machine once, by hand.
+Secrets are encrypted at rest with [sops](https://github.com/getsops/sops)
+using [age](https://age-encryption.org/), and wired into Home Manager via
+[sops-nix](https://github.com/Mic92/sops-nix). KeePassXC is the source of
+truth: everything below is defined there, and the files on disk are derived
+from it by `nix-secrets-setup`.
 
-This works identically on macOS, NixOS, and any other Linux box, because the
-wiring lives in the shared Home Manager module (`home/modules/secrets.nix`),
-not in a NixOS-only one — every machine in `home/default.nix` picks it up
-the same way.
+The wiring lives in the shared Home Manager module (`home/modules/secrets.nix`),
+so it works the same on macOS, NixOS and other Linux machines.
 
-## Why this combination
+## What lives where
 
-- **sops** keeps secrets as git-friendly, per-key-encrypted YAML — diffable
-  structure, encrypted values, reviewable in a PR.
-- **age** is a small, modern cipher with first-class sops and sops-nix
-  support and none of GPG's keyring/trust-model baggage.
-- **KeePassXC** is already the password vault for this setup (see
-  `scripts/ssh/keepassxc-prompt.sh`); storing the age identity there reuses
-  a vault that's already synced and backed up across machines, instead of
-  inventing a second secret-distribution channel.
+All entries are in the KeePassXC group `nix-config` (override with
+`NIX_SECRETS_GROUP`). Values are stored in each entry's UserName field.
 
-## One-time setup (do this once, on a trusted machine)
+| KeePassXC entry            | Holds                                      | Derived file (never contains plaintext in git)          |
+| -------------------------- | ------------------------------------------ | ------------------------------------------------------- |
+| `nix-config/age-key`       | age private key, attachment `keys.txt`     | `~/.config/sops/age/keys.txt` (local only, mode `0600`) |
+| `nix-config/age-key-label` | name of the key in `.sops.yaml`            | `.sops.yaml` (generated, git-ignored)                   |
+| `nix-config/username`      | macOS user that nix-darwin/HM manage       | `secrets/host.yaml` (sops-encrypted, committed)         |
+| `nix-config/hostname`      | host name, also the darwinConfigurations attribute | `secrets/host.yaml` (sops-encrypted, committed) |
 
-1. Generate a personal age key pair:
+The repo itself never names the Mac's user or host: `darwin/default.nix`
+reads them from `NIX_CONFIG_USERNAME`/`NIX_CONFIG_HOSTNAME`, which
+`darwin-switch` decrypts from `secrets/host.yaml`. Without them (pure
+evaluation, CI) `darwinConfigurations` is simply empty.
 
-   ```bash
-   age-keygen -o age-key.txt
-   ```
+## Setting up a machine
 
-   This prints `Public key: age1...` — copy it.
-
-2. Store the private key in KeePassXC:
-   - Create (or reuse) an entry titled `sops-age-key` in your KeePassXC
-     database.
-   - Attach `age-key.txt` to that entry as `keys.txt`.
-   - Securely delete the plaintext file afterward, e.g. `shred -u age-key.txt`.
-
-3. Put the public key in `.sops.yaml` at the repo root, replacing the
-   placeholder under `keys:`.
-
-4. Create the secrets file and add your first secret:
-
-   ```bash
-   sops secrets/secrets.yaml
-   ```
-
-   sops reads `.sops.yaml`, encrypts to the recipients listed there, and
-   opens `$EDITOR` on the plaintext. Commit the resulting encrypted file —
-   it's safe to store in git.
-
-## Bootstrapping a new machine
-
-On every machine that needs to decrypt secrets:
+Run the setup script with your database. On a machine without this flake
+activated yet, run it straight from the flake:
 
 ```bash
-sops-age-bootstrap /path/to/database.kdbx
+nix run .#nix-secrets-setup -- /path/to/database.kdbx
+# or, once Home Manager is active:
+nix-secrets-setup /path/to/database.kdbx
 ```
 
-`sops-age-bootstrap` is one of this flake's Home Manager packages (run
-`home-manager switch` first if it's not on `PATH` yet). It prompts for the
-KeePassXC master password, exports the `keys.txt` attachment from the
-`sops-age-key` entry, and writes it to `~/.config/sops/age/keys.txt`
-(mode `0600`) — the path `sops.age.keyFile` points at.
+It unlocks the database once, then:
 
-After that, `home-manager switch` can decrypt any secret declared in a
-`home/` module.
+1. Checks each entry in the table above. For every missing one it asks for
+   the value (with a suggested default), asks you to confirm it, stores it,
+   and reads it back to verify before moving on to the next. For the age key
+   you can generate a new one, import a key file, or use an existing
+   `~/.config/sops/age/keys.txt`.
+2. Installs the age key to `~/.config/sops/age/keys.txt` if it isn't there.
+   An existing file with a different key is left alone and reported.
+3. Regenerates `.sops.yaml` from the key label and public key. It refuses to
+   write the file unless git ignores it.
+4. Encrypts username and hostname into `secrets/host.yaml` if it is missing
+   or out of date, then decrypts it again to check.
+
+Rerunning it is safe: it only asks for what's missing. After changing a value
+in KeePassXC, rerun it and commit the updated `secrets/host.yaml`.
+
+## Applying the Mac's configuration
+
+```bash
+darwin-switch          # sudo darwin-rebuild switch --impure --flake .#<hostname>
+darwin-switch build    # build without activating
+```
+
+For the very first activation, before `darwin-switch` is on `PATH`:
+
+```bash
+nix run .#darwin-switch
+```
 
 ## Using a secret in a Home Manager module
+
+Add values to `secrets/secrets.yaml` with `sops secrets/secrets.yaml`, then:
 
 ```nix
 { config, ... }:
@@ -80,33 +80,22 @@ After that, `home-manager switch` can decrypt any secret declared in a
 }
 ```
 
-`config.sops.secrets."my-token".path` resolves to a runtime-only path
-(outside the Nix store, so it's never world-readable and never copied to
-other machines via substituters) that holds the decrypted value.
+`config.sops.secrets."my-token".path` resolves to a runtime-only path outside
+the Nix store holding the decrypted value.
 
 ## Adding or rotating a machine's access
 
-Add the new identity as another `age:` entry under `keys:` and
-`key_groups:` in `.sops.yaml` — either another personal key, or a per-host
-key derived from that machine's SSH host key via `ssh-to-age`, if a NixOS
-host later needs system-level secrets rather than per-user ones — then
-re-encrypt existing files so they include the new recipient:
-
-```bash
-sops updatekeys secrets/secrets.yaml
-```
+Every machine shares the one age key from KeePassXC, so a new machine only
+needs `nix-secrets-setup`. To rotate the key, while the old key is still in
+`~/.config/sops/age/keys.txt`: add the new public key to `.sops.yaml`, run
+`sops updatekeys secrets/*.yaml`, then replace the `keys.txt` attachment in
+KeePassXC and the local key file, and rerun `nix-secrets-setup`.
 
 ## Threat model notes
 
-- The age private key touches disk in plaintext at
-  `~/.config/sops/age/keys.txt` on every machine that decrypts secrets.
-  That's the same trust boundary as any sops-nix setup; protect it the way
-  you'd protect an SSH private key (full-disk encryption, screen lock,
-  etc.).
-- Losing the KeePassXC database without a backup means losing the ability
-  to bootstrap *new* machines, but already-bootstrapped machines keep
-  working — the key only needs to be read from KeePassXC once per machine.
-- A single shared personal key is the simplest model and what this draft
-  ships. If a secret should only ever be readable on specific machines,
-  split recipients per machine (see above) instead of using one key
-  everywhere.
+- The age private key sits in plaintext at `~/.config/sops/age/keys.txt` on
+  every machine that decrypts secrets. Protect it like an SSH private key.
+- `secrets/host.yaml` reveals which fields exist (`username`, `hostname`),
+  not their values.
+- Losing the KeePassXC database without a backup means losing the ability to
+  set up new machines; already set up machines keep working.

@@ -100,9 +100,13 @@
     in
     {
       homeConfigurations = import ./home { inherit lib; };
-      packages = forAllSystems (pkgs: {
-        default = mkUserEnv pkgs.stdenv.hostPlatform.system;
-      });
+      packages = forAllSystems (
+        pkgs:
+        {
+          default = mkUserEnv pkgs.stdenv.hostPlatform.system;
+        }
+        // import ./nix/secrets-tools.nix { inherit pkgs inputs; }
+      );
       nixosConfigurations = import ./nixos { inherit nixpkgs inputs lib; };
       darwinConfigurations = import ./darwin { inherit inputs lib; };
       checks = forAllSystems (pkgs: {

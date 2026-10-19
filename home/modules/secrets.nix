@@ -1,9 +1,14 @@
 {
   config,
+  inputs,
   lib,
   pkgs,
   ...
 }:
+
+let
+  tools = import ../../nix/secrets-tools.nix { inherit pkgs inputs; };
+in
 
 {
   options.customSecrets.enable = lib.mkEnableOption "sops-nix managed secrets (age + KeePassXC)";
@@ -22,18 +27,10 @@
       pkgs.age
       pkgs.sops
       # Pulled in unconditionally (not gated by customPackages.gui.enable):
-      # keepassxc-cli is needed to bootstrap the age identity even on
-      # headless machines, e.g. macmini.nix, which disables GUI packages.
+      # keepassxc-cli is needed to set up secrets even on headless machines,
+      # e.g. macmini.nix, which disables GUI packages.
       pkgs.keepassxc
-      (pkgs.writeShellApplication {
-        name = "sops-age-bootstrap";
-        runtimeInputs = [
-          pkgs.age
-          pkgs.coreutils
-          pkgs.keepassxc
-        ];
-        text = builtins.readFile ../../scripts/secrets/bootstrap-age-key.sh;
-      })
-    ];
+    ]
+    ++ builtins.attrValues tools;
   };
 }
