@@ -96,3 +96,10 @@ result
 # Vicinae extension build artifacts
 dotfiles/vicinae/*/node_modules/
 dotfiles/vicinae/*/vicinae-env.d.ts
+
+# Raw age/sops key material must never be committed; it belongs in
+# KeePassXC only (see docs/secrets.md).
+age-key.txt
+*.agekey
+secrets/keys.txt
+secrets/*.agekey

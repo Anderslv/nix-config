@@ -33,5 +33,8 @@
     enableMediaControl = lib.mkDefault false; # Opt-in per system
   };
 
+  # sops-nix wiring for age/KeePassXC-backed secrets (see docs/secrets.md).
+  customSecrets.enable = lib.mkDefault true;
+
   home.stateVersion = "24.05";
 }
