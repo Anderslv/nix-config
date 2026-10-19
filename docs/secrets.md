@@ -151,8 +151,13 @@ nix run .#secrets-setup-tests
 ```
 
 `dev/tests/secrets-setup.test.sh` covers every path (setting, guardrails,
-rotation across several simulated machines) against throwaway vaults, in one
-scratch directory with a fake `HOME` and a scrubbed environment.
+rotation across several simulated machines) against throwaway vaults and age
+keys, in one `mktemp -d` scratch directory. The script runs under `env -i`
+with a fake `HOME` and `TMPDIR` there. The scratch directory is kept and
+printed at the end: nothing is deleted recursively. Values are never
+printed. Afterwards the suite checks, from file metadata only, that
+`~/.config/sops`, `~/.config/nix-secrets`, `~/.local/state/nix-secrets` and
+the working tree are unchanged. The suite runs on bash 3.2 and 5.
 
 ## Threat model
 

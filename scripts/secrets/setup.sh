@@ -100,8 +100,18 @@ fi
 KEYFILE_ARGS=()
 [[ -n "${KEEPASSXC_KEYFILE:-}" ]] && KEYFILE_ARGS=(-k "$KEEPASSXC_KEYFILE")
 
+# Holds plaintext age keys while they're imported. Removed file by file on
+# exit, never recursively: rmdir only succeeds once the directory is empty.
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+TMP_FILES=(kp.err age-key.txt previous.txt host.yaml secrets.yaml)
+remove_tmp_files() {
+  local file
+  for file in "${TMP_FILES[@]}"; do
+    rm -f -- "$TMP_DIR/$file"
+  done
+  rmdir -- "$TMP_DIR" 2>/dev/null || echo "Left $TMP_DIR behind: it holds unexpected files." >&2
+}
+trap remove_tmp_files EXIT
 
 # --- the secrets --------------------------------------------------------------
 #
