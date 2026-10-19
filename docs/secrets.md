@@ -63,8 +63,32 @@ entries are confirmed (hidden secrets are typed twice). Skipped secrets are
 listed at the end; rerun the command to set them. Rerunning when everything
 is defined only refreshes the local files.
 
-The same choices work non-interactively: `--auto`, `--env FILE`,
-`--skip-missing`. Use `--help` for all options.
+`--auto`, `--env FILE` and `--skip-missing` do the same without any prompts:
+secrets they can't set are skipped, and anything that would need a
+confirmation is refused. Use `--help` for all options.
+
+### Guardrails
+
+- **A defined value is never replaced** except through `--rotate`. The age
+  key attachment is never force-imported outside a rotation either.
+- **Unreadable is not missing.** Only KeePassXC's "not found" counts as
+  missing; any other read error stops the script before it changes anything.
+- **Other fields are kept.** Values are written to the Password field only,
+  and KeePassXC keeps the previous value in the entry's history.
+- **An attachment that isn't an age key** in `nix-config/age-key` is
+  reported and left alone; resolve it by hand.
+- **The vault is backed up** before the first write of a run, to
+  `~/.local/state/nix-secrets/backups/` (mode 700, newest 5 kept). Runs that
+  change nothing make no backup.
+- **The KeePassXC app** is detected before writing: interactive runs ask to
+  continue (save and lock the database in the app first), non-interactive
+  runs warn.
+- **Local files**: if a value in `host.yaml`/`secrets.yaml` would be removed
+  or changed and you didn't ask for that (`--rotate`), the key names (never
+  values) are listed and the script asks first; non-interactive runs refuse.
+  The previous file is kept as `*.prev.yaml`. A file the installed key can't
+  decrypt is never replaced, and neither is a local age key that doesn't
+  match KeePassXC.
 
 ### .env format
 
@@ -101,12 +125,69 @@ nix run .#darwin-switch   # first activation, before darwin-switch is on PATH
    }
    ```
 
-## Rotating the age key
+## Rotation
 
-The local sops files are always regenerated from KeePassXC, so rotation is:
-replace the `keys.txt` attachment of `nix-config/age-key` (or delete the entry
-and let the setup create a new one), move `~/.config/sops/age/keys.txt` aside,
-and rerun `nix-secrets-setup` on each machine.
+`nix-secrets-setup --rotate NAME` replaces one defined secret. `NAME` is
+`age-key`, `age-key-label`, `username`, `hostname` or a name from
+`nix/secret-names.txt`. It asks for the new value like the setup does
+(automatically, from a .env file, typed in, or cancel), or takes it from
+`--auto`/`--env FILE` without prompts. The old value stays in the entry's
+history, the vault is backed up first, and the local files are regenerated.
+
+Rotation is simpler than usual because nothing is in git: there are no old
+ciphertexts to re-encrypt and no history to clean up.
+
+### age key
+
+When: a machine is lost or compromised, the key file leaked, or once a year.
+
+1. `nix-secrets-setup --rotate age-key` on one machine. The current key is
+   kept in `nix-config/age-key-previous`, a new one goes into
+   `nix-config/age-key`, the local key moves to `keys.txt.rotated-<date>`,
+   and the local files are re-encrypted with the new key.
+2. On every other machine, run `nix-secrets-setup`. A local key that matches
+   `age-key-previous` is recognised, set aside the same way and replaced; any
+   other mismatching key is still refused. Then `darwin-switch` /
+   `home-manager switch`.
+3. When all machines are done: `nix-secrets-setup --finish-age-key-rotation`
+   moves `age-key-previous` to KeePassXC's recycle bin and lists the old local
+   key files to delete. A new age key rotation is refused until then.
+
+A lost or compromised machine had every runtime secret in its
+`secrets.yaml`, so rotate those too (next section).
+
+### Runtime secrets (tokens, passwords)
+
+1. Issue the new credential at the provider; keep the old one valid for now.
+2. `nix-secrets-setup --rotate <name>` and enter the new value.
+3. Run `nix-secrets-setup` on every machine and switch; sops-nix updates the
+   decrypted file on activation.
+4. Check the new value works, then revoke the old one at the provider.
+
+### KeePassXC master password / key file
+
+Change it in the KeePassXC app; consider adding a key file or YubiKey
+challenge-response. If the old password may be known, that alone isn't
+enough: backups, synced copies and cloud version history are still encrypted
+with it. Rotate every secret inside (sections above) and delete old copies
+you control, including `~/.local/state/nix-secrets/backups/`.
+
+### Username / hostname
+
+`--rotate username` / `--rotate hostname`, then `darwin-switch` (it builds
+the configuration named after the new hostname). Values that were public
+before (e.g. in old git history) should be assumed known; rename the host
+(`scutil --set LocalHostName …`) if that matters.
+
+### Which to rotate
+
+| Event                                    | Rotate                                          |
+| ---------------------------------------- | ----------------------------------------------- |
+| Machine lost or compromised              | age key, then all runtime secrets               |
+| One token leaked                         | that token                                      |
+| `.kdbx` leaked, strong master password   | master password + key file; secrets if long-lived |
+| `.kdbx` leaked, password may be known    | everything                                      |
+| Routine                                  | age key yearly; tokens per provider policy      |
 
 ## Tests
 
@@ -115,7 +196,8 @@ nix run .#secrets-setup-tests
 ```
 
 `dev/tests/secrets-setup.test.sh` exercises every path (automatic, .env,
-guided, skip, validation, refusals) against throwaway vaults. Everything
+guided, skip, validation, guardrails, rotation across several simulated
+machines) against throwaway vaults. Everything
 happens in one `mktemp -d` directory with a fake `HOME` and a scrubbed
 environment. Nothing outside it is read or written, and only that directory
 is removed afterwards.

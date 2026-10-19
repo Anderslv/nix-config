@@ -29,6 +29,7 @@ in
       bash
       coreutils
       diffutils
+      findutils
       git
       gnugrep
       gnused
