@@ -1,7 +1,8 @@
 { nixpkgs, inputs }:
 let
   mkHomeConfig = import ./mkHomeConfig.nix { inherit inputs; };
-  mkPkgs = import ./mkPkgs.nix { inherit inputs allowUnfreePredicate; };
+  overlays = import ./overlays.nix { inherit inputs allowUnfreePredicate; };
+  mkPkgs = import ./mkPkgs.nix { inherit inputs overlays allowUnfreePredicate; };
   forAllSystems =
     function:
     nixpkgs.lib.genAttrs [
@@ -56,6 +57,7 @@ in
     mkHomeConfig
     mkPkgs
     mkUserEnv
+    overlays
     forAllSystems
     generalPackages
     allowUnfreePredicate
