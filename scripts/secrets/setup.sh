@@ -1,90 +1,93 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# nix-secrets-setup
+#
 # KeePassXC is the only source of truth for this repo's secrets. This script
-# checks that every secret is defined there and helps define the missing
-# ones: automatically, from a .env file, guided one at a time, or skipped for
-# now. Each value is read back from KeePassXC to confirm it was stored.
 #
-# It then derives local files, outside the repo and never committed:
+#   1. checks that every secret is defined in the vault,
+#   2. helps define the missing ones (automatically, from a .env file, typed
+#      in, or skipped for now) and reads each one back to confirm it,
+#   3. derives the local files, outside the repo and never committed:
 #
-#   ~/.config/sops/age/keys.txt         age identity
-#   ~/.config/nix-secrets/.sops.yaml    sops recipients
-#   ~/.config/nix-secrets/host.yaml     username/hostname, read by darwin-switch
-#   ~/.config/nix-secrets/secrets.yaml  runtime secrets, read by sops-nix
+#        ~/.config/sops/age/keys.txt         age identity
+#        ~/.config/nix-secrets/.sops.yaml    sops recipients
+#        ~/.config/nix-secrets/host.yaml     username, hostname (darwin-switch)
+#        ~/.config/nix-secrets/secrets.yaml  runtime secrets (sops-nix)
 #
-# Guardrails: a defined value is only ever replaced through --rotate; a value
-# that can't be read stops the script instead of looking "missing"; the vault
-# is backed up before the first write of a run; local files that would lose
-# or change values are only replaced after confirmation.
-#
+# It never replaces a defined value unless asked to with --rotate, stops on
+# anything it can't read, and backs the vault up before changing it.
 # See docs/secrets.md.
 
 usage() {
-  cat >&2 <<EOF
-Usage: $0 [options] [path-to-database.kdbx]
+  cat <<EOF
+Usage: nix-secrets-setup [options] [vault.kdbx]
 
-Options:
-  --auto          Set missing secrets automatically where a value can be
-                  derived; skip the rest.
-  --env FILE      Set missing secrets from a .env file; skip the rest.
-  --skip-missing  Only report missing secrets, then sync what is defined.
-  --rotate NAME   Replace a defined secret: age-key, age-key-label, username,
-                  hostname, or a name from nix/secret-names.txt. Combine with
-                  --auto or --env to choose the new value without prompts.
+  --auto          set missing secrets automatically where possible
+  --env FILE      set missing secrets from a .env file
+  --skip-missing  only report missing secrets, then refresh the local files
+  --rotate NAME   replace a defined secret (age-key, age-key-label, username,
+                  hostname, or a name from nix/secret-names.txt)
   --finish-age-key-rotation
-                  Once every machine has the new age key, move the previous
-                  one to KeePassXC's recycle bin.
-  -h, --help      Show this help.
+                  retire the previous age key once every machine has the new one
 
---auto, --env and --skip-missing never prompt: secrets they can't set are
-skipped, and anything that would need a confirmation is refused. Without
-them, the script asks how to set missing secrets.
+Without --auto, --env or --skip-missing it asks how to set what's missing.
+With them it never prompts: what it can't set is skipped, and anything that
+would need a confirmation is refused.
 
-The database can also be given as \$KEEPASSXC_DATABASE. Optional:
-\$KEEPASSXC_KEYFILE, \$NIX_SECRETS_GROUP (default: nix-config),
-\$NIX_SECRETS_DIR (default: ~/.config/nix-secrets),
-\$NIX_SECRETS_BACKUP_DIR (default: ~/.local/state/nix-secrets/backups).
+The vault path is remembered after the first run. Environment:
+KEEPASSXC_DATABASE, KEEPASSXC_KEYFILE, NIX_SECRETS_GROUP (nix-config),
+NIX_SECRETS_DIR (~/.config/nix-secrets), NIX_SECRETS_BACKUP_DIR.
 
-.env keys: NIX_SECRETS_AGE_KEY (an AGE-SECRET-KEY-... line),
-NIX_SECRETS_AGE_KEY_LABEL, NIX_SECRETS_USERNAME, NIX_SECRETS_HOSTNAME, and
-SECRET_<NAME> for each name in nix/secret-names.txt (upper case, - as _).
+.env keys: NIX_SECRETS_AGE_KEY, NIX_SECRETS_AGE_KEY_LABEL, NIX_SECRETS_USERNAME,
+NIX_SECRETS_HOSTNAME, and SECRET_<NAME> per runtime secret (upper case, - as _).
 EOF
 }
 
-MODE=""
+# --- options ------------------------------------------------------------------
+
+MODE=""           # auto | env | guided | skip; empty means "ask"
+NONINTERACTIVE="" # set by --auto, --env and --skip-missing
 ENV_FILE=""
-NONINTERACTIVE=""
 ROTATE=""
 FINISH_ROTATION=""
-DB_PATH="${KEEPASSXC_DATABASE:-}"
+DB_PATH=""
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --auto) MODE="auto" NONINTERACTIVE=1 ;;
-    --env)
-      MODE="env" NONINTERACTIVE=1
-      ENV_FILE="${2:?--env needs a file}"
-      shift
-      ;;
+    --env) MODE="env" NONINTERACTIVE=1 ENV_FILE="${2:?--env needs a file}" && shift ;;
     --skip-missing) MODE="skip" NONINTERACTIVE=1 ;;
-    --rotate)
-      ROTATE="${2:?--rotate needs a name}"
-      shift
-      ;;
+    --rotate) ROTATE="${2:?--rotate needs a name}" && shift ;;
     --finish-age-key-rotation) FINISH_ROTATION=1 ;;
-    -h | --help)
-      usage
-      exit 0
-      ;;
-    -*)
-      usage
-      exit 1
-      ;;
+    -h | --help) usage && exit 0 ;;
+    -*) usage >&2 && exit 1 ;;
     *) DB_PATH="$1" ;;
   esac
   shift
 done
 
+# --- where things live --------------------------------------------------------
+
+GROUP="${NIX_SECRETS_GROUP:-nix-config}"
+PREVIOUS_AGE_ENTRY="$GROUP/age-key-previous"
+ATTACHMENT="keys.txt"
+
+REPO="${NIX_CONFIG_DIR:-$(git rev-parse --show-toplevel)}"
+SECRETS_DIR="${NIX_SECRETS_DIR:-$HOME/.config/nix-secrets}" # see home/modules/secrets.nix
+AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"
+SOPS_CONFIG="$SECRETS_DIR/.sops.yaml"
+STATE_DIR="$HOME/.local/state/nix-secrets"
+BACKUP_DIR="${NIX_SECRETS_BACKUP_DIR:-$STATE_DIR/backups}"
+BACKUPS_KEPT=5
+
+# sops defaults to ~/Library/Application Support on macOS; use sops-nix's key.
+export SOPS_AGE_KEY_FILE="$AGE_KEY_FILE"
+
+DB_PATH="${DB_PATH:-${KEEPASSXC_DATABASE:-}}"
+if [[ -z "$DB_PATH" && -f "$STATE_DIR/vault" ]]; then
+  DB_PATH="$(cat "$STATE_DIR/vault")"
+fi
 if [[ -z "$DB_PATH" ]]; then
   read -rp "Path to KeePassXC database (.kdbx): " DB_PATH
 fi
@@ -94,69 +97,61 @@ if [[ ! -f "$DB_PATH" ]]; then
   exit 1
 fi
 
-GROUP="${NIX_SECRETS_GROUP:-nix-config}"
-RUNTIME_GROUP="$GROUP/secrets"
-AGE_ATTACHMENT="keys.txt"
-PREVIOUS_AGE_ENTRY="$GROUP/age-key-previous"
-
-REPO="${NIX_CONFIG_DIR:-$(git rev-parse --show-toplevel)}"
-SECRET_NAMES_FILE="$REPO/nix/secret-names.txt"
-
-# Must match home/modules/secrets.nix.
-SECRETS_DIR="${NIX_SECRETS_DIR:-$HOME/.config/nix-secrets}"
-AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"
-SOPS_CONFIG="$SECRETS_DIR/.sops.yaml"
-BACKUP_DIR="${NIX_SECRETS_BACKUP_DIR:-$HOME/.local/state/nix-secrets/backups}"
-BACKUPS_KEPT=5
-# sops' default on macOS is ~/Library/Application Support; pin it to the
-# file sops-nix reads.
-export SOPS_AGE_KEY_FILE="$AGE_KEY_FILE"
-
 KEYFILE_ARGS=()
-if [[ -n "${KEEPASSXC_KEYFILE:-}" ]]; then
-  KEYFILE_ARGS=(-k "$KEEPASSXC_KEYFILE")
-fi
+[[ -n "${KEEPASSXC_KEYFILE:-}" ]] && KEYFILE_ARGS=(-k "$KEEPASSXC_KEYFILE")
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# --- the secrets --------------------------------------------------------------
+#
+# Values live in the Password field of their entry; the age key is the
+# keys.txt attachment of its entry.
+
+CATALOGUE="
+age-key        NIX_SECRETS_AGE_KEY        age private key that encrypts the local sops files
+age-key-label  NIX_SECRETS_AGE_KEY_LABEL  name of the age key in .sops.yaml
+username       NIX_SECRETS_USERNAME       macOS user nix-darwin and Home Manager manage
+hostname       NIX_SECRETS_HOSTNAME       host name; also the darwinConfigurations attribute
+"
+
+SECRETS=()
+RUNTIME_NAMES=()
+declare -A ENV_KEY=() ABOUT=()
+
+add_secret() {
+  SECRETS+=("$1")
+  ENV_KEY[$1]="$2"
+  ABOUT[$1]="$3"
+}
+
+while read -r id key about; do
+  [[ -n "$id" ]] && add_secret "$id" "$key" "$about"
+done <<<"$CATALOGUE"
+
+if [[ -f "$REPO/nix/secret-names.txt" ]]; then
+  while read -r name; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    RUNTIME_NAMES+=("$name")
+    key="${name//-/_}"
+    add_secret "runtime:$name" "SECRET_${key^^}" "runtime secret for sops-nix"
+  done <"$REPO/nix/secret-names.txt"
+fi
+
+entry_of() {
+  case "$1" in
+    runtime:*) echo "$GROUP/secrets/${1#runtime:}" ;;
+    *) echo "$GROUP/$1" ;;
+  esac
+}
+
+is_sensitive() { [[ "$1" == age-key || "$1" == runtime:* ]]; }
+
+# --- output -------------------------------------------------------------------
+
 ok() { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; }
 note() { printf '  \033[33m-\033[0m %s\n' "$*"; }
-
-timestamp() { date +%Y%m%d-%H%M%S; }
-
-# Every keepassxc-cli call gets the master password on stdin, so it is only
-# asked for once.
-kp() {
-  local cmd="$1"
-  shift
-  printf '%s\n' "$KP_PASSWORD" | keepassxc-cli "$cmd" -q "${KEYFILE_ARGS[@]}" "$DB_PATH" "$@"
-}
-
-# kp_read <outfile> <command> [args...]
-# Returns 0 when found and 3 when the entry or attachment doesn't exist. Any
-# other failure stops the script: an unreadable value must never be mistaken
-# for a missing one and then overwritten.
-kp_read() {
-  local outfile="$1"
-  shift
-  if kp "$@" >"$outfile" 2>"$TMP_DIR/kp.err"; then
-    return 0
-  fi
-  if grep -qE '^Could not find (entry with path|attachment with name) ' "$TMP_DIR/kp.err"; then
-    return 3
-  fi
-  fail "Could not read from KeePassXC ($1 ${*: -1}): $(head -n 1 "$TMP_DIR/kp.err")"
-  fail "Stopping without changing anything."
-  exit 1
-}
-
-entry_exists() {
-  local rc=0
-  kp_read "$TMP_DIR/entry" show "$1" || rc=$?
-  [[ $rc -eq 0 ]]
-}
 
 confirm() {
   local answer
@@ -164,303 +159,271 @@ confirm() {
   [[ "$answer" == [yY]* ]]
 }
 
+# menu <prompt> <key:label>...: prints the options and sets CHOICE to one of
+# their keys.
+menu() {
+  local prompt="$1" option
+  shift
+  for option in "$@"; do
+    printf '  [%s] %s\n' "${option%%:*}" "${option#*:}"
+  done
+  while true; do
+    read -rp "$prompt" CHOICE
+    for option in "$@"; do
+      [[ "$CHOICE" == "${option%%:*}" ]] && return
+    done
+  done
+}
+
+# --- the vault ----------------------------------------------------------------
+
+# Every keepassxc-cli call gets the master password on stdin, so it is asked
+# for only once.
+kp() {
+  local command="$1"
+  shift
+  printf '%s\n' "$KP_PASSWORD" | keepassxc-cli "$command" -q "${KEYFILE_ARGS[@]}" "$DB_PATH" "$@"
+}
+
+# kp_get <command> [args...]: sets OUTPUT. Fails when the entry or attachment
+# doesn't exist; any other error stops the script, so an unreadable value is
+# never mistaken for a missing one and overwritten.
+kp_get() {
+  if OUTPUT="$(kp "$@" 2>"$TMP_DIR/kp.err")"; then
+    return 0
+  fi
+  if grep -qE '^Could not find (entry with path|attachment with name) ' "$TMP_DIR/kp.err"; then
+    return 1
+  fi
+  fail "Could not read from KeePassXC ($1 ${*: -1}): $(head -n 1 "$TMP_DIR/kp.err")"
+  fail "Stopping without changing anything."
+  exit 1
+}
+
+entry_exists() { kp_get show "$1"; }
+
 unlock() {
   while true; do
     read -rsp "KeePassXC master password for $(basename "$DB_PATH"): " KP_PASSWORD
     echo
     if kp ls >/dev/null 2>&1; then
       ok "Database unlocked"
+      mkdir -p "$STATE_DIR"
+      printf '%s\n' "$DB_PATH" >"$STATE_DIR/vault" # remembered for next time
       return
     fi
     fail "Could not unlock the database, try again."
   done
 }
 
-ensure_group() {
-  if ! kp ls "$1" >/dev/null 2>&1; then
-    kp mkdir "$1" >/dev/null
+# read_state <id>: sets STATE (defined, missing, or conflict: an attachment
+# that isn't an age key) and CURRENT (the stored value).
+read_state() {
+  CURRENT=""
+  if [[ "$1" == age-key ]]; then
+    if ! kp_get attachment-export --stdout "$(entry_of age-key)" "$ATTACHMENT"; then
+      STATE=missing
+      return
+    fi
+    CURRENT="$OUTPUT"
+    if is_age_identity "$CURRENT"; then STATE=defined; else STATE=conflict; fi
+    return
   fi
+  kp_get show -a Password "$(entry_of "$1")" && CURRENT="$OUTPUT"
+  if [[ -n "$CURRENT" ]]; then STATE=defined; else STATE=missing; fi
 }
 
-# --- before the first write ----------------------------------------------------
+is_age_identity() { age-keygen -y <(printf '%s\n' "$1") >/dev/null 2>&1; }
+public_key() { age-keygen -y <(printf '%s\n' "$1"); }
 
+# Runs once, right before the first change to the vault.
 WRITE_PREPARED=""
+before_first_write() {
+  [[ -n "$WRITE_PREPARED" ]] && return
+  WRITE_PREPARED=1
+
+  if command -v pgrep >/dev/null && pgrep -xi keepassxc >/dev/null 2>&1; then
+    note "The KeePassXC app is running. Save and lock the database there first:"
+    note "unsaved changes in the app could overwrite what this script writes."
+    if [[ -z "$NONINTERACTIVE" ]] && ! confirm "  Continue?"; then
+      fail "Stopped before changing anything."
+      exit 1
+    fi
+  fi
+  backup_vault
+}
 
 backup_vault() {
-  local base dest backups
+  local base backup backups
   base="$(basename "$DB_PATH" .kdbx)"
+  backup="$BACKUP_DIR/$base.$(date +%Y%m%d-%H%M%S)-$$.kdbx"
   mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
-  dest="$BACKUP_DIR/$base.$(timestamp)-$$.kdbx"
-  (umask 077 && cp "$DB_PATH" "$dest")
-  if ! cmp -s "$DB_PATH" "$dest"; then
-    fail "Could not back up the vault to $dest; stopping before any change."
+  (umask 077 && cp "$DB_PATH" "$backup")
+  if ! cmp -s "$DB_PATH" "$backup"; then
+    fail "Could not back up the vault to $backup; stopping before any change."
     exit 1
   fi
-  ok "Backed up the vault to $dest"
+  ok "Backed up the vault to $backup"
 
-  # Timestamps sort chronologically; keep only the newest few.
+  # Names sort by time; keep the newest few.
   backups=("$BACKUP_DIR/$base".????????-??????-*.kdbx)
   if [[ ${#backups[@]} -gt $BACKUPS_KEPT ]]; then
     rm -f -- "${backups[@]:0:${#backups[@]}-BACKUPS_KEPT}"
   fi
 }
 
-# Runs once, right before the first change to the vault.
-prepare_write() {
-  [[ -n "$WRITE_PREPARED" ]] && return
-  WRITE_PREPARED=1
-  if command -v pgrep >/dev/null 2>&1 && pgrep -xi keepassxc >/dev/null 2>&1; then
-    note "The KeePassXC app is running. Save and lock the database there first:"
-    note "unsaved changes in the app could overwrite what this script writes."
-    if [[ -z "$NONINTERACTIVE" ]]; then
-      confirm "  Continue?" || {
-        fail "Stopped before changing anything."
-        exit 1
-      }
-    fi
-  fi
-  backup_vault
+ensure_groups() {
+  local path="" part parts
+  IFS=/ read -ra parts <<<"${1%/*}"
+  for part in "${parts[@]}"; do
+    path="${path:+$path/}$part"
+    kp ls "$path" >/dev/null 2>&1 || kp mkdir "$path" >/dev/null
+  done
 }
 
-# --- secrets -------------------------------------------------------------------
-#
-# Each secret has an id. Values live in the Password field of their entry;
-# the age key is an attachment.
+# --- storing a value ----------------------------------------------------------
 
-SECRETS=(age-key age-key-label username hostname)
-RUNTIME_NAMES=()
-if [[ -f "$SECRET_NAMES_FILE" ]]; then
-  while read -r name; do
-    [[ -z "$name" || "$name" == \#* ]] && continue
-    RUNTIME_NAMES+=("$name")
-    SECRETS+=("runtime:$name")
-  done <"$SECRET_NAMES_FILE"
-fi
+ROTATING="" # the one id --rotate may overwrite
 
-entry_of() {
-  case "$1" in
-    runtime:*) echo "$RUNTIME_GROUP/${1#runtime:}" ;;
-    *) echo "$GROUP/$1" ;;
-  esac
-}
-
-describe() {
-  case "$1" in
-    age-key) echo "age private key that encrypts the local sops files" ;;
-    age-key-label) echo "name of the age key in .sops.yaml" ;;
-    username) echo "macOS user nix-darwin and Home Manager manage" ;;
-    hostname) echo "host name; also the darwinConfigurations attribute" ;;
-    runtime:*) echo "runtime secret for sops-nix" ;;
-  esac
-}
-
-env_key_of() {
-  local name
-  case "$1" in
-    age-key) echo "NIX_SECRETS_AGE_KEY" ;;
-    age-key-label) echo "NIX_SECRETS_AGE_KEY_LABEL" ;;
-    username) echo "NIX_SECRETS_USERNAME" ;;
-    hostname) echo "NIX_SECRETS_HOSTNAME" ;;
-    runtime:*)
-      name="${1#runtime:}"
-      name="${name//-/_}"
-      echo "SECRET_${name^^}"
-      ;;
-  esac
-}
-
-is_sensitive() { [[ "$1" == age-key || "$1" == runtime:* ]]; }
-
-default_hostname() {
-  if command -v scutil >/dev/null 2>&1; then
-    scutil --get LocalHostName 2>/dev/null && return
-  fi
-  hostname -s 2>/dev/null || true
-}
-
-# Prints the value an id would get automatically; fails if there is none.
-auto_value() {
-  case "$1" in
-    age-key-label) echo "primary" ;;
-    username) id -un ;;
-    hostname) default_hostname ;;
-    *) return 1 ;;
-  esac
-}
-
-validate() {
-  if [[ -z "$2" ]]; then
-    fail "The value is empty."
-    return 1
-  fi
-  if [[ "$1" == age-key-label && ! "$2" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    fail "The label may only contain letters, digits, - and _."
-    return 1
-  fi
-}
-
-# read_value <id>: sets VALUE; succeeds when it is non-empty.
-read_value() {
-  local rc=0
-  VALUE=""
-  kp_read "$TMP_DIR/value" show -a Password "$(entry_of "$1")" || rc=$?
-  [[ $rc -eq 0 ]] && VALUE="$(cat "$TMP_DIR/value")"
-  [[ -n "$VALUE" ]]
-}
-
-# read_age_key [entry]: copies the attachment to $TMP_DIR/kp-age.txt and sets
-# AGE_STATE to defined, missing, or conflict (an attachment that isn't an age
-# identity).
-read_age_key() {
-  local entry="${1:-$(entry_of age-key)}" rc=0
-  kp_read "$TMP_DIR/kp-age.txt" attachment-export --stdout "$entry" "$AGE_ATTACHMENT" || rc=$?
-  if [[ $rc -ne 0 ]]; then
-    AGE_STATE=missing
-  elif age-keygen -y "$TMP_DIR/kp-age.txt" >/dev/null 2>&1; then
-    AGE_STATE=defined
-  else
-    AGE_STATE=conflict
-  fi
-}
-
-# state_of <id>: sets STATE to defined, missing or conflict.
-state_of() {
-  if [[ "$1" == age-key ]]; then
-    read_age_key
-    STATE="$AGE_STATE"
-  elif read_value "$1"; then
-    STATE=defined
-  else
-    STATE=missing
-  fi
-}
-
-# The one id --rotate may overwrite in this run.
-OVERWRITE_ID=""
-
-# store_value <id> <value>; reads it back and reports whether it matches.
-store_value() {
-  local id="$1" value="$2" entry cmd=add
+# store <id> <value>: writes the value to the vault and reads it back.
+store() {
+  local id="$1" value="$2" entry
   entry="$(entry_of "$id")"
-  validate "$id" "$value" || return 1
+  valid "$id" "$value" || return 1
 
-  state_of "$id"
-  if [[ "$STATE" != missing && "$OVERWRITE_ID" != "$id" ]]; then
-    fail "$entry already has a value; not overwriting it (use --rotate $id)."
-    return 1
-  fi
-  if [[ "$STATE" == defined && "$VALUE" == "$value" ]]; then
-    note "$entry already has this value; nothing to change."
-    return 0
-  fi
-
-  prepare_write
-  ensure_group "$GROUP"
-  [[ "$id" == runtime:* ]] && ensure_group "$RUNTIME_GROUP"
-  # edit -p only replaces the Password; other fields are kept, and
-  # KeePassXC keeps the old value in the entry's history.
-  entry_exists "$entry" && cmd=edit
-  printf '%s\n%s\n' "$KP_PASSWORD" "$value" |
-    keepassxc-cli "$cmd" -q -p "${KEYFILE_ARGS[@]}" "$DB_PATH" "$entry" >/dev/null
-
-  if read_value "$id" && [[ "$VALUE" == "$value" ]]; then
-    if is_sensitive "$id"; then
-      ok "$entry stored and verified"
+  read_state "$id"
+  if [[ "$STATE" != missing && "$ROTATING" != "$id" ]]; then
+    if [[ "$id" == age-key ]]; then
+      fail "$entry already has a $ATTACHMENT attachment; not overwriting it."
     else
-      ok "$entry = $value, stored and verified"
+      fail "$entry already has a value; not overwriting it (use --rotate $id)."
     fi
-    return 0
-  fi
-  fail "$entry did not read back the value that was stored."
-  return 1
-}
-
-# store_age_key <file with an age identity>
-store_age_key() {
-  local source="$1" entry
-  entry="$(entry_of age-key)"
-  if ! age-keygen -y "$source" >/dev/null 2>&1; then
-    fail "Not a valid age identity."
     return 1
   fi
-
-  read_age_key
-  if [[ "$AGE_STATE" != missing && "$OVERWRITE_ID" != age-key ]]; then
-    fail "$entry already has a $AGE_ATTACHMENT attachment; not overwriting it."
-    return 1
-  fi
-  if [[ "$AGE_STATE" == defined ]] && cmp -s "$TMP_DIR/kp-age.txt" "$source"; then
-    note "$entry already holds this key; nothing to change."
+  if [[ "$STATE" == defined && "$CURRENT" == "$value" ]]; then
+    note "$entry already holds this value; nothing to change."
     return 0
   fi
 
-  prepare_write
-  ensure_group "$GROUP"
-  if [[ "$AGE_STATE" == missing ]]; then
-    entry_exists "$entry" || kp add "$entry" >/dev/null
-    kp attachment-import "$entry" "$AGE_ATTACHMENT" "$source" >/dev/null
+  before_first_write
+  ensure_groups "$entry"
+  if [[ "$id" == age-key ]]; then
+    write_age_key "$entry" "$value"
   else
-    keep_previous_age_key
-    kp attachment-import -f "$entry" "$AGE_ATTACHMENT" "$source" >/dev/null
+    write_password "$entry" "$value"
   fi
 
-  read_age_key
-  if [[ "$AGE_STATE" == defined ]] && cmp -s "$TMP_DIR/kp-age.txt" "$source"; then
-    ok "$entry stored and verified (public key $(age-keygen -y "$source"))"
-    return 0
+  read_state "$id"
+  if [[ "$CURRENT" != "$value" ]]; then
+    fail "$entry did not read back the value that was stored."
+    return 1
   fi
-  fail "The attachment read back from $entry does not match."
-  return 1
+  if [[ "$id" == age-key ]]; then
+    ok "$entry stored and verified (public key $(public_key "$value"))"
+  elif is_sensitive "$id"; then
+    ok "$entry stored and verified"
+  else
+    ok "$entry = $value, stored and verified"
+  fi
 }
 
-# During rotation, other machines still have the old key; keep it in its own
-# entry so they can recognise it (see install_age_key).
+# Only the Password changes: other fields are kept, and KeePassXC keeps the
+# old value in the entry's history.
+write_password() {
+  local command=add
+  entry_exists "$1" && command=edit
+  printf '%s\n%s\n' "$KP_PASSWORD" "$2" |
+    keepassxc-cli "$command" -q -p "${KEYFILE_ARGS[@]}" "$DB_PATH" "$1" >/dev/null
+}
+
+write_age_key() {
+  local entry="$1" file="$TMP_DIR/age-key.txt"
+  (umask 077 && printf '%s\n' "$2" >"$file")
+  if [[ "$STATE" == missing ]]; then
+    entry_exists "$entry" || kp add "$entry" >/dev/null
+    kp attachment-import "$entry" "$ATTACHMENT" "$file" >/dev/null
+  else
+    keep_previous_age_key "$CURRENT"
+    kp attachment-import -f "$entry" "$ATTACHMENT" "$file" >/dev/null
+  fi
+}
+
+# During an age key rotation the other machines still have the old key; keep
+# it so they can recognise it (see install_age_key).
 keep_previous_age_key() {
-  cp "$TMP_DIR/kp-age.txt" "$TMP_DIR/previous.txt"
+  local file="$TMP_DIR/previous.txt"
+  (umask 077 && printf '%s\n' "$1" >"$file")
   kp add "$PREVIOUS_AGE_ENTRY" >/dev/null
-  kp attachment-import "$PREVIOUS_AGE_ENTRY" "$AGE_ATTACHMENT" "$TMP_DIR/previous.txt" >/dev/null
-  read_age_key "$PREVIOUS_AGE_ENTRY"
-  if [[ "$AGE_STATE" != defined ]] || ! cmp -s "$TMP_DIR/kp-age.txt" "$TMP_DIR/previous.txt"; then
+  kp attachment-import "$PREVIOUS_AGE_ENTRY" "$ATTACHMENT" "$file" >/dev/null
+  if ! kp_get attachment-export --stdout "$PREVIOUS_AGE_ENTRY" "$ATTACHMENT" || [[ "$OUTPUT" != "$1" ]]; then
     fail "Could not keep the current key in $PREVIOUS_AGE_ENTRY; stopping."
     exit 1
   fi
   ok "Kept the current key in $PREVIOUS_AGE_ENTRY"
 }
 
-generate_age_key() {
-  rm -f "$TMP_DIR/new-key.txt"
-  (umask 077 && age-keygen -o "$TMP_DIR/new-key.txt" 2>/dev/null)
-  echo "$TMP_DIR/new-key.txt"
+valid() {
+  if [[ -z "$2" ]]; then
+    fail "The value is empty."
+  elif [[ "$1" == age-key-label && ! "$2" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    fail "The label may only contain letters, digits, - and _."
+  elif [[ "$1" == age-key ]] && ! is_age_identity "$2"; then
+    fail "Not a valid age identity."
+  else
+    return 0
+  fi
+  return 1
 }
 
-# --- ways of setting a secret ---------------------------------------------------
+# --- where a new value comes from ---------------------------------------------
+#
+# Each value_from_* sets NEW for an id, or fails; set_with stores the result.
 
-set_auto() {
-  local id="$1" value
-  if [[ "$id" == age-key ]]; then
-    # Reuse a key this machine already has, unless that is the key being
-    # rotated away from.
-    if [[ -f "$AGE_KEY_FILE" && "$OVERWRITE_ID" != age-key ]]; then
-      store_age_key "$AGE_KEY_FILE"
-    else
-      store_age_key "$(generate_age_key)"
-    fi
-    return
-  fi
-  if ! value="$(auto_value "$id")" || [[ -z "$value" ]]; then
-    note "No automatic value for $(entry_of "$id")."
-    return 1
-  fi
-  store_value "$id" "$value"
+set_with() { "value_from_$2" "$1" && store "$1" "$NEW"; }
+
+new_age_key() { age-keygen 2>/dev/null; }
+
+# What "automatically" means for an id; empty when there's nothing.
+auto_hint() {
+  case "$1" in
+    age-key)
+      if [[ -f "$AGE_KEY_FILE" && "$ROTATING" != age-key ]]; then
+        echo "reuse $AGE_KEY_FILE"
+      else
+        echo "generate a new key"
+      fi
+      ;;
+    age-key-label) echo primary ;;
+    username) id -un ;;
+    hostname) scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || true ;;
+  esac
+}
+
+value_from_auto() {
+  case "$1" in
+    age-key)
+      # This machine's key, unless that is the key being rotated away from.
+      if [[ -f "$AGE_KEY_FILE" && "$ROTATING" != age-key ]]; then
+        NEW="$(cat "$AGE_KEY_FILE")"
+      else
+        NEW="$(new_age_key)"
+      fi
+      ;;
+    runtime:*)
+      note "No automatic value for $(entry_of "$1")."
+      return 1
+      ;;
+    *) NEW="$(auto_hint "$1")" ;;
+  esac
 }
 
 declare -A ENV_VALUES=()
 ENV_LOADED=""
 
+# Parsed, never sourced: values are taken literally.
 load_env_file() {
-  local file="$1" line key value
-  file="${file/#\~/$HOME}"
+  local file="${1/#\~/$HOME}" line key value
   if [[ ! -f "$file" ]]; then
     fail "No such file: $file"
     return 1
@@ -469,169 +432,178 @@ load_env_file() {
     fail "$file is tracked by git; refusing to read secrets from it."
     return 1
   fi
-  # Parsed, never sourced: values are taken literally.
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line#export }"
-    [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    [[ "${line#export }" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
     key="${BASH_REMATCH[1]}"
     value="${BASH_REMATCH[2]}"
     if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
       value="${BASH_REMATCH[1]}"
     fi
-    ENV_VALUES["$key"]="$value"
+    ENV_VALUES[$key]="$value"
   done <"$file"
   ENV_LOADED="$file"
   ok "Loaded $file"
 }
 
-set_from_env() {
-  local id="$1" key file
-  key="$(env_key_of "$id")"
-  if [[ -z "$ENV_LOADED" ]]; then
-    read -rp "  Path to .env file: " file
-    load_env_file "$file" || return 1
-  fi
+ask_env_file() {
+  local file
+  read -rp "  Path to .env file: " file
+  load_env_file "$file"
+}
+
+value_from_env() {
+  local key="${ENV_KEY[$1]}"
+  [[ -n "$ENV_LOADED" ]] || ask_env_file || return 1
   if [[ -z "${ENV_VALUES[$key]:-}" ]]; then
     note "$key is not in $ENV_LOADED."
     return 1
   fi
-  if [[ "$id" == age-key ]]; then
-    (umask 077 && printf '%s\n' "${ENV_VALUES[$key]}" >"$TMP_DIR/env-key.txt")
-    store_age_key "$TMP_DIR/env-key.txt"
-  else
-    store_value "$id" "${ENV_VALUES[$key]}"
-  fi
+  NEW="${ENV_VALUES[$key]}"
 }
 
-set_manually() {
-  local id="$1" value again choice path default
-  if [[ "$id" == age-key ]]; then
-    read -rp "  [g]enerate a new key or [i]mport a key file? " choice
-    case "$choice" in
-      g*) store_age_key "$(generate_age_key)" ;;
-      i*)
-        read -rp "  Path to age key file: " path
-        store_age_key "${path/#\~/$HOME}"
-        ;;
-      *) return 1 ;;
-    esac
-    return
-  fi
-
-  if is_sensitive "$id"; then
-    read -rsp "  Value (hidden): " value
-    echo
-    read -rsp "  Again to confirm: " again
-    echo
-    if [[ "$value" != "$again" ]]; then
+value_from_typed() {
+  local again file default
+  if [[ "$1" == age-key ]]; then
+    menu "  Choice: " "g:generate a new key" "i:import a key file"
+    if [[ "$CHOICE" == g ]]; then
+      NEW="$(new_age_key)"
+      return
+    fi
+    read -rp "  Path to age key file: " file
+    NEW="$(cat "${file/#\~/$HOME}" 2>/dev/null)" || {
+      fail "Can't read $file."
+      return 1
+    }
+  elif is_sensitive "$1"; then
+    read -rsp "  Value (hidden): " NEW && echo
+    read -rsp "  Again to confirm: " again && echo
+    if [[ "$NEW" != "$again" ]]; then
       fail "The two entries differ."
       return 1
     fi
   else
-    default="$(auto_value "$id" 2>/dev/null || true)"
-    read -rp "  Value${default:+ [$default]}: " value
-    value="${value:-$default}"
-    validate "$id" "$value" || return 1
-    confirm "  Store '$value' in $(entry_of "$id")?" || return 1
-  fi
-  store_value "$id" "$value"
-}
-
-auto_hint() {
-  if [[ "$1" == age-key ]]; then
-    if [[ -f "$AGE_KEY_FILE" && "$OVERWRITE_ID" != age-key ]]; then
-      echo "reuse $AGE_KEY_FILE"
-    else
-      echo "generate a new key"
-    fi
-  else
-    auto_value "$1" 2>/dev/null || true
+    default="$(auto_hint "$1")"
+    read -rp "  Value${default:+ [$default]}: " NEW
+    NEW="${NEW:-$default}"
+    valid "$1" "$NEW" && confirm "  Store '$NEW' in $(entry_of "$1")?"
   fi
 }
 
+# --- checking and filling in the vault ----------------------------------------
+
+MISSING=()
 SKIPPED=()
-SKIP_REST=""
 CONFLICTS=()
+SKIP_REST=""
 
-# Asks how to set one secret until it is stored or skipped.
-guided() {
-  local id="$1" auto choice
-  auto="$(auto_hint "$id")"
-  echo
-  echo "Missing: $(entry_of "$id") ($(describe "$id"))"
-  while true; do
-    [[ -n "$auto" ]] && echo "  [a] automatically ($auto)"
-    echo "  [e] from a .env file${ENV_LOADED:+ ($ENV_LOADED)}"
-    echo "  [m] enter it now"
-    echo "  [s] skip this one for now"
-    echo "  [S] skip all remaining for now"
-    read -rp "  Choice: " choice
-    case "$choice" in
-      a) [[ -n "$auto" ]] && set_auto "$id" && return ;;
-      e) set_from_env "$id" && return ;;
-      m) set_manually "$id" && return ;;
-      s)
-        SKIPPED+=("$id")
-        return
+check_vault() {
+  local id
+  for id in "${SECRETS[@]}"; do
+    read_state "$id"
+    case "$STATE" in
+      defined) ok "$(entry_of "$id")" ;;
+      missing)
+        fail "$(entry_of "$id") is missing"
+        MISSING+=("$id")
         ;;
-      S)
-        SKIPPED+=("$id")
-        SKIP_REST=1
-        return
+      conflict)
+        fail "$(entry_of "$id") has a $ATTACHMENT attachment that isn't an age key; not touching it"
+        CONFLICTS+=("$id")
         ;;
     esac
-    echo "  Not set; choose again."
   done
 }
 
-handle_missing() {
+fill_missing() {
+  local id
+  [[ ${#MISSING[@]} -gt 0 ]] || return 0
+  [[ -n "$MODE" ]] || choose_mode
+  for id in "${MISSING[@]}"; do
+    fill "$id"
+  done
+}
+
+choose_mode() {
+  echo
+  echo "${#MISSING[@]} secret(s) missing. How do you want to set them?"
+  while [[ -z "$MODE" ]]; do
+    menu "Choice: " \
+      "a:automatically where possible, asking for the rest" \
+      "e:from a .env file, asking for the rest" \
+      "g:guided, choosing for each secret" \
+      "s:skip all for now"
+    case "$CHOICE" in
+      a) MODE="auto" ;;
+      e) ask_env_file && MODE="env" ;;
+      g) MODE="guided" ;;
+      s) MODE="skip" ;;
+    esac
+  done
+}
+
+fill() {
   local id="$1"
-  if [[ -n "$SKIP_REST" || "$MODE" == skip ]]; then
+  if [[ "$MODE" == skip || -n "$SKIP_REST" ]]; then
     SKIPPED+=("$id")
     return
   fi
   echo
   case "$MODE" in
-    auto)
-      echo "Setting $(entry_of "$id") automatically"
-      set_auto "$id" && return
-      ;;
-    env)
-      echo "Setting $(entry_of "$id") from $ENV_LOADED"
-      set_from_env "$id" && return
-      ;;
+    auto) echo "Setting $(entry_of "$id") automatically" && set_with "$id" auto && return ;;
+    env) echo "Setting $(entry_of "$id") from $ENV_LOADED" && set_with "$id" env && return ;;
   esac
   if [[ -n "$NONINTERACTIVE" ]]; then
     SKIPPED+=("$id")
-    return
+  else
+    ask_how "$id"
   fi
-  guided "$id"
 }
 
-# --- rotation ----------------------------------------------------------------------
+# Asks how to set one secret until it is stored or skipped.
+ask_how() {
+  local id="$1" hint options
+  hint="$(auto_hint "$id")"
+  echo "Missing: $(entry_of "$id") (${ABOUT[$id]})"
+  while true; do
+    options=()
+    [[ -n "$hint" ]] && options+=("a:automatically ($hint)")
+    options+=(
+      "e:from a .env file${ENV_LOADED:+ ($ENV_LOADED)}"
+      "m:enter it now"
+      "s:skip this one for now"
+      "S:skip all remaining for now"
+    )
+    menu "  Choice: " "${options[@]}"
+    case "$CHOICE" in
+      a) set_with "$id" auto && return ;;
+      e) set_with "$id" env && return ;;
+      m) set_with "$id" typed && return ;;
+      s) SKIPPED+=("$id") && return ;;
+      S) SKIPPED+=("$id") && SKIP_REST=1 && return ;;
+    esac
+    echo "  Not set; choose again."
+  done
+}
 
-# Values in the local sops files that are expected to change in this run, as
-# "file:key".
-declare -A EXPECTED_CHANGES=()
-AGE_KEY_REPLACED=""
+# --- rotation -----------------------------------------------------------------
+
+declare -A EXPECTED_CHANGES=() # "file:key" of local values allowed to change
 
 rotate() {
-  local id="" name entry choice
-  case "$ROTATE" in
-    age-key | age-key-label | username | hostname) id="$ROTATE" ;;
-    *)
-      for name in "${RUNTIME_NAMES[@]}"; do
-        [[ "$name" == "$ROTATE" ]] && id="runtime:$name"
-      done
-      ;;
-  esac
+  local id="" candidate entry
+  for candidate in "$1" "runtime:$1"; do
+    if [[ -n "${ENV_KEY[$candidate]:-}" ]]; then
+      id="$candidate"
+      break
+    fi
+  done
   if [[ -z "$id" ]]; then
-    fail "Unknown secret '$ROTATE'. Choose age-key, age-key-label, username, hostname or a name from nix/secret-names.txt."
+    fail "Unknown secret '$1'. Choose age-key, age-key-label, username, hostname or a name from nix/secret-names.txt."
     exit 1
   fi
   entry="$(entry_of "$id")"
 
-  state_of "$id"
+  read_state "$id"
   if [[ "$STATE" != defined ]]; then
     fail "$entry is not defined yet; run without --rotate to set it."
     exit 1
@@ -643,190 +615,68 @@ rotate() {
   fi
 
   echo
-  echo "Rotating $entry ($(describe "$id"))"
-  if ! is_sensitive "$id"; then
-    note "Current value: $VALUE"
-  fi
+  echo "Rotating $entry (${ABOUT[$id]})"
+  is_sensitive "$id" || note "Current value: $CURRENT"
   note "The old value stays in the entry's history in KeePassXC."
-  OVERWRITE_ID="$id"
+  ROTATING="$id"
 
-  case "$MODE" in
-    auto) set_auto "$id" || exit 1 ;;
-    env) set_from_env "$id" || exit 1 ;;
-    *)
-      while true; do
-        echo "  [a] automatically ($(auto_hint "$id"))"
-        echo "  [e] from a .env file"
-        echo "  [m] enter it now"
-        echo "  [c] cancel"
-        read -rp "  Choice: " choice
-        case "$choice" in
-          a) set_auto "$id" && break ;;
-          e) set_from_env "$id" && break ;;
-          m) set_manually "$id" && break ;;
-          c)
-            note "Rotation cancelled; nothing changed."
-            exit 0
-            ;;
-        esac
-        echo "  Not rotated; choose again."
-      done
-      ;;
-  esac
-  OVERWRITE_ID=""
+  if [[ "$MODE" == auto || "$MODE" == env ]]; then
+    set_with "$id" "$MODE" || exit 1
+  else
+    while true; do
+      menu "  Choice: " "a:automatically ($(auto_hint "$id"))" "e:from a .env file" "m:enter it now" "c:cancel"
+      case "$CHOICE" in
+        a) set_with "$id" auto && break ;;
+        e) set_with "$id" env && break ;;
+        m) set_with "$id" typed && break ;;
+        c) note "Rotation cancelled; nothing changed." && exit 0 ;;
+      esac
+      echo "  Not rotated; choose again."
+    done
+  fi
 
+  ROTATING=""
   case "$id" in
     username | hostname) EXPECTED_CHANGES["host.yaml:$id"]=1 ;;
     runtime:*) EXPECTED_CHANGES["secrets.yaml:${id#runtime:}"]=1 ;;
   esac
 }
 
-finish_rotation() {
-  local rotated
+finish_age_key_rotation() {
+  local old
   if ! entry_exists "$PREVIOUS_AGE_ENTRY"; then
     note "No previous age key in KeePassXC; nothing to finish."
     return
   fi
   echo
   echo "Every machine should have run nix-secrets-setup with the new age key."
-  if [[ -z "$NONINTERACTIVE" ]]; then
-    confirm "Move $PREVIOUS_AGE_ENTRY to KeePassXC's recycle bin?" || {
-      note "Kept $PREVIOUS_AGE_ENTRY."
-      return
-    }
+  if [[ -z "$NONINTERACTIVE" ]] && ! confirm "Move $PREVIOUS_AGE_ENTRY to KeePassXC's recycle bin?"; then
+    note "Kept $PREVIOUS_AGE_ENTRY."
+    return
   fi
-  prepare_write
+  before_first_write
   kp rm "$PREVIOUS_AGE_ENTRY" >/dev/null
   if entry_exists "$PREVIOUS_AGE_ENTRY"; then
     fail "Could not remove $PREVIOUS_AGE_ENTRY."
     exit 1
   fi
   ok "Moved $PREVIOUS_AGE_ENTRY to the recycle bin"
-  for rotated in "$AGE_KEY_FILE".rotated-*; do
-    [[ -e "$rotated" ]] && note "Old local key kept at $rotated; delete it once you're sure."
+  for old in "$AGE_KEY_FILE".rotated-*; do
+    [[ -e "$old" ]] && note "Old local key kept at $old; delete it once you're sure."
   done
 }
 
-# --- local files ------------------------------------------------------------------
+# --- local files --------------------------------------------------------------
 
-install_age_key() {
-  local public_kp public_local
-  read_age_key
-  public_kp="$(age-keygen -y "$TMP_DIR/kp-age.txt")"
-
-  if [[ -f "$AGE_KEY_FILE" ]]; then
-    public_local="$(age-keygen -y "$AGE_KEY_FILE")"
-    if [[ "$public_local" == "$public_kp" ]]; then
-      ok "$AGE_KEY_FILE matches KeePassXC"
-      return
-    fi
-    # Only a key that KeePassXC marks as the one being rotated away from is
-    # replaced; any other key is left alone.
-    read_age_key "$PREVIOUS_AGE_ENTRY"
-    if [[ "$AGE_STATE" != defined || "$(age-keygen -y "$TMP_DIR/kp-age.txt")" != "$public_local" ]]; then
-      fail "$AGE_KEY_FILE holds a different key than KeePassXC; not touching it."
-      fail "Move it aside and rerun to install the key from KeePassXC."
-      exit 1
-    fi
-    local rotated
-    rotated="$AGE_KEY_FILE.rotated-$(timestamp)"
-    mv "$AGE_KEY_FILE" "$rotated"
-    chmod 600 "$rotated"
-    note "The age key was rotated; kept the old one at $rotated"
-    AGE_KEY_REPLACED=1
-  fi
-
-  read_age_key
-  mkdir -p "$(dirname "$AGE_KEY_FILE")"
-  chmod 700 "$(dirname "$AGE_KEY_FILE")"
-  (umask 077 && cp "$TMP_DIR/kp-age.txt" "$AGE_KEY_FILE")
-  chmod 600 "$AGE_KEY_FILE"
-  ok "Installed $AGE_KEY_FILE"
-}
-
-write_sops_config() {
-  local label="$1"
-  cat >"$SOPS_CONFIG" <<EOF
-# Generated by nix-secrets-setup from KeePassXC ($GROUP).
-keys:
-  - &$label $(age-keygen -y "$AGE_KEY_FILE")
-creation_rules:
-  - path_regex: \.ya?ml$
-    key_groups:
-      - age:
-          - *$label
-EOF
-  ok "Wrote $SOPS_CONFIG"
-}
-
-# Lists keys whose value in the current file would be removed or changed by
-# writing the wanted content, except those expected to change.
-unexpected_changes() {
-  local name="$1" current="$2" want="$3" key
-  {
-    jq -r --argjson w "$want" 'to_entries[] | . as $e | select(($w | has($e.key)) | not) | "\($e.key) (removed)"' <<<"$current"
-    jq -r --argjson w "$want" 'to_entries[] | . as $e | select(($w | has($e.key)) and $w[$e.key] != $e.value) | "\($e.key) (changed)"' <<<"$current"
-  } | while read -r key; do
-    [[ -n "${EXPECTED_CHANGES["$name:${key% (*}"]:-}" ]] || echo "$key"
-  done
-}
-
-# write_sops_file <name> <json>; rewrites the file only when it changed, and
-# asks before dropping or changing values nobody asked to change.
-write_sops_file() {
-  local name="$1" file="$SECRETS_DIR/$1" want current unexpected
-  want="$(jq -S . <<<"$2")"
-
-  if [[ -f "$file" ]]; then
-    if current="$(sops decrypt --output-type json "$file" 2>/dev/null)"; then
-      current="$(jq -S . <<<"$current")"
-      if [[ "$current" == "$want" ]]; then
-        ok "$file is up to date"
-        return
-      fi
-      unexpected="$(unexpected_changes "$name" "$current" "$want")"
-      if [[ -n "$unexpected" ]]; then
-        note "$file differs from KeePassXC for:"
-        while read -r line; do note "  $line"; done <<<"$unexpected"
-        if [[ -n "$NONINTERACTIVE" ]]; then
-          fail "Not replacing $file without confirmation; rerun without --auto/--env/--skip-missing."
-          exit 1
-        fi
-        confirm "  Replace $file with the values in KeePassXC?" || {
-          note "Kept $file unchanged."
-          return
-        }
-      fi
-    elif [[ -z "$AGE_KEY_REPLACED" ]]; then
-      fail "Can't decrypt $file with $AGE_KEY_FILE; not replacing it."
-      fail "Move it aside if it is stale, then rerun."
-      exit 1
-    fi
-    # Previous version, kept with a .yaml extension so sops can still read it.
-    cp -p "$file" "${file%.yaml}.prev.yaml"
-  fi
-
-  (cd "$SECRETS_DIR" &&
-    sops --config "$SOPS_CONFIG" encrypt --filename-override "$name" \
-      --input-type json --output-type yaml <<<"$want" >"$TMP_DIR/$name")
-  mv "$TMP_DIR/$name" "$file"
-  chmod 600 "$file"
-  current="$(sops decrypt --output-type json "$file" | jq -S .)"
-  if [[ "$current" == "$want" ]]; then
-    ok "Wrote $file and verified it decrypts${AGE_KEY_REPLACED:+ with the new key}"
-  else
-    fail "$file did not decrypt back to the KeePassXC values."
-    exit 1
-  fi
-}
+AGE_KEY_REPLACED=""
 
 sync_local_files() {
-  local json name username hostname label
-
+  local label username hostname name json="{}"
   echo
   echo "Deriving local files in $SECRETS_DIR"
-  read_age_key
-  if [[ "$AGE_STATE" != defined ]]; then
+
+  read_state age-key
+  if [[ "$STATE" != defined ]]; then
     note "No age key in KeePassXC; skipping all local files."
     return
   fi
@@ -836,106 +686,173 @@ sync_local_files() {
     exit 1
   fi
   chmod 700 "$SECRETS_DIR"
-  install_age_key
+  install_age_key "$CURRENT"
 
-  label=primary
-  read_value age-key-label && label="$VALUE"
+  read_state age-key-label && label="${CURRENT:-primary}"
   write_sops_config "$label"
 
-  username=""
-  hostname=""
-  read_value username && username="$VALUE"
-  read_value hostname && hostname="$VALUE"
+  read_state username && username="$CURRENT"
+  read_state hostname && hostname="$CURRENT"
   if [[ -n "$username" && -n "$hostname" ]]; then
-    json="$(jq -n --arg u "$username" --arg h "$hostname" '{username: $u, hostname: $h}')"
-    write_sops_file host.yaml "$json"
+    write_sops_file host.yaml "$(jq -n --arg u "$username" --arg h "$hostname" '{username: $u, hostname: $h}')"
   else
     note "username/hostname not both defined; skipping host.yaml"
   fi
 
-  json="{}"
   for name in "${RUNTIME_NAMES[@]}"; do
-    read_value "runtime:$name" || continue
-    json="$(jq --arg k "$name" --arg v "$VALUE" '.[$k] = $v' <<<"$json")"
+    read_state "runtime:$name"
+    [[ -n "$CURRENT" ]] && json="$(jq --arg k "$name" --arg v "$CURRENT" '.[$k] = $v' <<<"$json")"
   done
   write_sops_file secrets.yaml "$json"
 }
 
-# --- main ---------------------------------------------------------------------------
+# install_age_key <identity from the vault>
+install_age_key() {
+  local local_key rotated
+  if [[ -f "$AGE_KEY_FILE" ]]; then
+    local_key="$(cat "$AGE_KEY_FILE")"
+    if [[ "$(public_key "$local_key")" == "$(public_key "$1")" ]]; then
+      ok "$AGE_KEY_FILE matches KeePassXC"
+      return
+    fi
+    # Only the key being rotated away from is replaced; any other is left alone.
+    if ! kp_get attachment-export --stdout "$PREVIOUS_AGE_ENTRY" "$ATTACHMENT" ||
+      [[ "$(public_key "$OUTPUT")" != "$(public_key "$local_key")" ]]; then
+      fail "$AGE_KEY_FILE holds a different key than KeePassXC; not touching it."
+      fail "Move it aside and rerun to install the key from KeePassXC."
+      exit 1
+    fi
+    rotated="$AGE_KEY_FILE.rotated-$(date +%Y%m%d-%H%M%S)"
+    mv "$AGE_KEY_FILE" "$rotated"
+    note "The age key was rotated; kept the old one at $rotated"
+    AGE_KEY_REPLACED=1
+  fi
+  mkdir -p "$(dirname "$AGE_KEY_FILE")"
+  chmod 700 "$(dirname "$AGE_KEY_FILE")"
+  (umask 077 && printf '%s\n' "$1" >"$AGE_KEY_FILE")
+  ok "Installed $AGE_KEY_FILE"
+}
+
+write_sops_config() {
+  cat >"$SOPS_CONFIG" <<EOF
+# Generated by nix-secrets-setup from KeePassXC ($GROUP).
+keys:
+  - &$1 $(age-keygen -y "$AGE_KEY_FILE")
+creation_rules:
+  - path_regex: \.ya?ml$
+    key_groups:
+      - age:
+          - *$1
+EOF
+  ok "Wrote $SOPS_CONFIG"
+}
+
+# write_sops_file <name> <json>: rewrites the file only when it changed, and
+# asks before removing or changing values nobody asked to change.
+write_sops_file() {
+  local name="$1" file="$SECRETS_DIR/$1" want current surprises
+  want="$(jq -S . <<<"$2")"
+
+  if [[ -f "$file" ]]; then
+    if current="$(sops decrypt --output-type json "$file" 2>/dev/null)"; then
+      current="$(jq -S . <<<"$current")"
+      if [[ "$current" == "$want" ]]; then
+        ok "$file is up to date"
+        return
+      fi
+      surprises="$(unexpected_changes "$name" "$current" "$want")"
+      if [[ -n "$surprises" ]] && ! may_replace "$file" "$surprises"; then
+        return
+      fi
+    elif [[ -z "$AGE_KEY_REPLACED" ]]; then
+      fail "Can't decrypt $file with $AGE_KEY_FILE; not replacing it."
+      fail "Move it aside if it is stale, then rerun."
+      exit 1
+    fi
+    cp -p "$file" "${file%.yaml}.prev.yaml" # .yaml, so sops can still read it
+  fi
+
+  (cd "$SECRETS_DIR" &&
+    sops --config "$SOPS_CONFIG" encrypt --filename-override "$name" \
+      --input-type json --output-type yaml <<<"$want" >"$TMP_DIR/$name")
+  mv "$TMP_DIR/$name" "$file"
+  chmod 600 "$file"
+
+  if [[ "$(sops decrypt --output-type json "$file" | jq -S .)" != "$want" ]]; then
+    fail "$file did not decrypt back to the KeePassXC values."
+    exit 1
+  fi
+  ok "Wrote $file and verified it decrypts${AGE_KEY_REPLACED:+ with the new key}"
+}
+
+# Keys whose value would be removed or changed, other than expected ones.
+unexpected_changes() {
+  local name="$1" current="$2" want="$3" change
+  jq -r --argjson want "$want" '
+    to_entries[] | . as $e
+    | if ($want | has($e.key)) | not then "\($e.key) (removed)"
+      elif $want[$e.key] != $e.value then "\($e.key) (changed)"
+      else empty end' <<<"$current" |
+    while read -r change; do
+      [[ -n "${EXPECTED_CHANGES["$name:${change% (*}"]:-}" ]] || echo "$change"
+    done
+}
+
+# may_replace <file> <changes>: lists the changes (key names only) and asks.
+may_replace() {
+  local change
+  note "$1 differs from KeePassXC for:"
+  while read -r change; do note "  $change"; done <<<"$2"
+  if [[ -n "$NONINTERACTIVE" ]]; then
+    fail "Not replacing $1 without confirmation; rerun without --auto/--env/--skip-missing."
+    exit 1
+  fi
+  confirm "  Replace $1 with the values in KeePassXC?" && return
+  note "Kept $1 unchanged."
+  return 1
+}
+
+# --- summary ------------------------------------------------------------------
+
+summarize() {
+  local id
+  echo
+  if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+    echo "Skipped for now (rerun nix-secrets-setup to set them):"
+    for id in "${SKIPPED[@]}"; do note "$(entry_of "$id")"; done
+  elif [[ ${#CONFLICTS[@]} -eq 0 ]]; then
+    echo "All secrets are defined."
+  fi
+  if [[ -n "$ENV_LOADED" ]]; then
+    echo "The values from $ENV_LOADED are now in KeePassXC; consider deleting that file."
+  fi
+  if [[ ${#CONFLICTS[@]} -gt 0 ]]; then
+    echo "Resolve these in KeePassXC by hand, then rerun:"
+    for id in "${CONFLICTS[@]}"; do note "$(entry_of "$id")"; done
+    exit 1
+  fi
+  if [[ "$(uname -s)" == Darwin ]]; then
+    echo "Next: darwin-switch"
+  else
+    echo "Next: home-manager switch"
+  fi
+}
+
+# --- main ---------------------------------------------------------------------
 
 echo "Checking KeePassXC secrets in $DB_PATH (group: $GROUP)"
 unlock
 if [[ "$MODE" == env ]]; then
-  load_env_file "$ENV_FILE"
+  load_env_file "$ENV_FILE" || exit 1
 fi
 
 if [[ -n "$FINISH_ROTATION" ]]; then
-  finish_rotation
+  finish_age_key_rotation
   exit 0
 fi
-if [[ -n "$ROTATE" ]]; then
-  rotate
-fi
+[[ -z "$ROTATE" ]] || rotate "$ROTATE"
 
-MISSING=()
-for id in "${SECRETS[@]}"; do
-  state_of "$id"
-  case "$STATE" in
-    defined) ok "$(entry_of "$id")" ;;
-    missing)
-      fail "$(entry_of "$id") is missing"
-      MISSING+=("$id")
-      ;;
-    conflict)
-      fail "$(entry_of "$id") has a $AGE_ATTACHMENT attachment that isn't an age key; not touching it"
-      CONFLICTS+=("$id")
-      ;;
-  esac
-done
-
-if [[ ${#MISSING[@]} -gt 0 && -z "$MODE" ]]; then
-  echo
-  echo "${#MISSING[@]} secret(s) missing. How do you want to set them?"
-  echo "  [a] automatically where possible, asking for the rest"
-  echo "  [e] from a .env file, asking for the rest"
-  echo "  [g] guided, choosing for each secret"
-  echo "  [s] skip all for now"
-  while [[ -z "$MODE" ]]; do
-    read -rp "Choice: " choice
-    case "$choice" in
-      a) MODE="auto" ;;
-      e)
-        read -rp "Path to .env file: " ENV_FILE
-        load_env_file "$ENV_FILE" && MODE="env"
-        ;;
-      g) MODE="guided" ;;
-      s) MODE="skip" ;;
-    esac
-  done
-fi
-
-for id in "${MISSING[@]}"; do
-  handle_missing "$id"
-done
-
+check_vault
+fill_missing
 sync_local_files
-
-echo
-if [[ ${#SKIPPED[@]} -gt 0 ]]; then
-  echo "Skipped for now (rerun nix-secrets-setup to set them):"
-  for id in "${SKIPPED[@]}"; do
-    note "$(entry_of "$id")"
-  done
-elif [[ ${#CONFLICTS[@]} -eq 0 ]]; then
-  echo "All secrets are defined."
-fi
-if [[ -n "$ENV_LOADED" ]]; then
-  echo "The values from $ENV_LOADED are now in KeePassXC; consider deleting that file."
-fi
-if [[ ${#CONFLICTS[@]} -gt 0 ]]; then
-  echo "Resolve these in KeePassXC by hand, then rerun:"
-  for id in "${CONFLICTS[@]}"; do
-    note "$(entry_of "$id")"
-  done
-  exit 1
-fi
+summarize

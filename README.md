@@ -69,8 +69,12 @@ nix flake show
 
 ## Secrets
 
-No secrets are committed, encrypted or not. They live only in KeePassXC;
-`nix-secrets-setup` checks the vault, helps fill in anything missing, and
-derives local sops files outside the repo for
-[sops-nix](https://github.com/Mic92/sops-nix) and `darwin-switch`. See
-[`docs/secrets.md`](docs/secrets.md).
+No secrets are committed, encrypted or not: they live only in KeePassXC, and
+each machine derives what it needs.
+
+```bash
+nix run .#nix-secrets-setup -- ~/path/to/vault.kdbx   # check the vault, fill in what's missing
+nix run .#darwin-switch                               # apply the Mac's configuration
+```
+
+See [`docs/secrets.md`](docs/secrets.md).
